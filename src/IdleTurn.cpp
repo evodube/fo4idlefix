@@ -72,7 +72,7 @@ namespace IdleTurn
 			float  dist;       // to player
 			float  relPlayer;  // player bearing relative to NPC facing (rad, + = to the right)
 			float  dt;         // Actor::Update delta
-			bool   zeroed;     // fix touched the turn variable this frame
+			bool   restrained; // held in place (SetRestrained): can't turn at all
 			std::array<float, kMaxVars> vars;
 		};
 
@@ -106,12 +106,31 @@ namespace IdleTurn
 
 			std::uint32_t episodes{ 0 };
 			std::uint32_t returns{ 0 };
+
+			// graph turn: the animation graph asked to turn (TurnDelta) while standing, whether or not the body did
+			bool   gtActive{ false };
+			double gtStart{ 0.0 };
+			double gtQuietSince{ 0.0 };
+			float  gtPeak{ 0.0f };
+			float  gtHeading{ 0.0f };
+			float  gtRel{ 0.0f };
+			float  gtDist{ 0.0f };
+			bool   gtRestrained{ false };
+			std::uint32_t blocked{ 0 };    // frames the fix cleared this NPC's turn request (since the graph turn began)
+			std::uint32_t graphTurns{ 0 };
 		};
 
 		std::mutex                                   g_lock;
 		std::unordered_map<std::uint32_t, State>     g_actors;
 		std::vector<RE::BSFixedString>               g_varNames;
-		std::optional<RE::BSFixedString>             g_turnVar;
+		std::vector<RE::BSFixedString>               g_turnVarNames;  // [0] decides, all get cleared
+		std::optional<RE::BSFixedString>             g_speedVar;
+		int                                          g_tdIndex{ -1 };  // TurnDelta's slot in g_varNames
+
+		std::atomic<std::uint64_t> g_blockedRestrained{ 0 };
+		std::atomic<std::uint64_t> g_blockedSmall{ 0 };
+		std::atomic<std::uint64_t> g_preUpdateCalls{ 0 };
+		std::atomic<std::uint64_t> g_blockedInPreUpdate{ 0 };
 		std::once_flag                               g_initOnce;
 
 		// global stats (under g_lock)
@@ -123,7 +142,7 @@ namespace IdleTurn
 		std::uint32_t g_episodes{ 0 };
 		std::uint32_t g_returns{ 0 };
 		std::uint32_t g_towardPlayer{ 0 };
-		std::uint64_t g_zeroed{ 0 };
+		std::uint32_t g_graphTurns{ 0 };
 		int           g_dumps{ 0 };
 
 		// ------------------------------------------------------------------
@@ -294,7 +313,7 @@ namespace IdleTurn
 					lastDumped = s.t;
 					a_out.push_back(std::format("  {:+.3f}s  hdg {:7.2f} dev {:+6.2f} pos ({:.1f}, {:.1f}, {:.1f}) player {:.0f}u@{:+.0f}deg dt {:.1f}ms{}{}",
 						s.t - a_state.epStart, Deg(s.heading), Deg(WrapPi(s.heading - a_state.startHeading)), s.x, s.y, s.z,
-						s.dist, Deg(s.relPlayer), s.dt * 1000.0f, s.zeroed ? " [zeroed]" : "", VarValues(a_state, s)));
+						s.dist, Deg(s.relPlayer), s.dt * 1000.0f, s.restrained ? " [restrained]" : "", VarValues(a_state, s)));
 				}
 				for (; ev != a_state.events.end(); ++ev) {
 					a_out.push_back(std::format("  {:+.3f}s  EVENT {}{}{} (hdg {:.1f})", ev->t - a_state.epStart, ev->tag,
@@ -328,9 +347,10 @@ namespace IdleTurn
 			if (g_dtCount > 0) {
 				const double avg = g_dtSum / static_cast<double>(g_dtCount);
 				a_out.push_back(std::format(
-					"stats: {} NPCs tracked | NPC update dt avg {:.2f}ms (~{:.0f} fps) min {:.2f}ms max {:.2f}ms | idle turns {} ({} turn-and-return, {} toward player) | fix zeroed {} frames",
+					"stats: {} NPCs tracked | NPC update dt avg {:.2f}ms (~{:.0f} fps) min {:.2f}ms max {:.2f}ms | body turns {} ({} turn-and-return, {} toward player) | graph turn requests {} | fix cleared {} restrained + {} small requests ({} of them before the anim update, {} anim updates seen)",
 					g_actors.size(), avg * 1000.0, avg > 0.0 ? 1.0 / avg : 0.0, g_dtMin * 1000.0f, g_dtMax * 1000.0f,
-					g_episodes, g_returns, g_towardPlayer, g_zeroed));
+					g_episodes, g_returns, g_towardPlayer, g_graphTurns, g_blockedRestrained.load(), g_blockedSmall.load(),
+					g_blockedInPreUpdate.load(), g_preUpdateCalls.load()));
 			}
 			g_lastStats = a_now;
 			g_dtSum = 0.0;
@@ -339,6 +359,151 @@ namespace IdleTurn
 			g_dtMax = 0.0f;
 
 			std::erase_if(g_actors, [&](const auto& kv) { return a_now - kv.second.lastSeen > kForgetAfter; });
+		}
+
+		// ------------------------------------------------------------------
+		// The fix
+		// ------------------------------------------------------------------
+
+		const RE::ActorState* StateOf(const RE::Actor* a_actor)
+		{
+			return static_cast<const RE::ActorState*>(a_actor);
+		}
+
+		bool IsRestrained(const RE::Actor* a_actor)
+		{
+			return StateOf(a_actor)->lifeState == static_cast<std::uint32_t>(RE::LIFE_STATE::kRestrained);
+		}
+
+		enum class Blocked
+		{
+			kNo,
+			kRestrained,
+			kSmall
+		};
+
+		// An NPC standing still (or held in place) whose animation graph asks for a turn: the request is cleared
+		// before the graph acts on it, so the turn-in-place step never starts. Held NPCs can't turn at all (their
+		// feet step round and snap back), so theirs is always cleared; anyone else only for small turns, so they
+		// still turn round to face you. Never with a weapon out (combat, aiming).
+		// Never called with g_lock held: it talks to the animation graph.
+		Blocked Prevent(RE::Actor* a_actor)
+		{
+			if (!Settings::bPreventIdleTurns || g_turnVarNames.empty() || !a_actor || a_actor->IsPlayerRef()) {
+				return Blocked::kNo;
+			}
+			const auto* st = StateOf(a_actor);
+			const auto  life = static_cast<RE::LIFE_STATE>(st->lifeState);
+			if (life != RE::LIFE_STATE::kAlive && life != RE::LIFE_STATE::kRestrained) {
+				return Blocked::kNo;
+			}
+			if (st->GetWeaponMagicDrawn()) {
+				return Blocked::kNo;
+			}
+
+			const bool held = life == RE::LIFE_STATE::kRestrained && Settings::bRestrainedNeverTurn;
+			if (!held) {
+				if (Settings::fBlockBelowDeg <= 0.0f || !g_speedVar) {
+					return Blocked::kNo;
+				}
+				float speed = 0.0f;
+				if (!a_actor->GetGraphVariableImplFloat(*g_speedVar, speed) || speed > Settings::fStandingSpeed) {
+					return Blocked::kNo;
+				}
+			}
+
+			float turn = 0.0f;
+			if (!a_actor->GetGraphVariableImplFloat(g_turnVarNames[0], turn) || turn == 0.0f || std::isnan(turn)) {
+				return Blocked::kNo;
+			}
+			if (!held && Deg(std::abs(turn)) >= Settings::fBlockBelowDeg) {
+				return Blocked::kNo;  // a real turn (to face you, say): let it happen
+			}
+			for (const auto& var : g_turnVarNames) {
+				float v = 0.0f;
+				if (a_actor->GetGraphVariableImplFloat(var, v) && v != 0.0f) {
+					a_actor->SetGraphVariableFloat(var, 0.0f);
+				}
+			}
+			if (held) {
+				++g_blockedRestrained;
+				return Blocked::kRestrained;
+			}
+			++g_blockedSmall;
+			return Blocked::kSmall;
+		}
+
+		void NoteBlocked(RE::TESFormID a_id)
+		{
+			std::scoped_lock lock(g_lock);
+			if (const auto it = g_actors.find(a_id); it != g_actors.end()) {
+				++it->second.blocked;
+			}
+		}
+
+		// Turn requests from the graph, logged whether or not the body turned (a held NPC's never does: the
+		// shuffle is all in the feet). The values are read before the fix clears them, so this shows what the
+		// game asked for.
+		void TrackGraphTurn(std::uint32_t a_formID, State& a_state, const Sample& a_s, bool a_stationary, float a_bearing, std::vector<std::string>& a_out)
+		{
+			if (g_tdIndex < 0 || static_cast<std::size_t>(g_tdIndex) >= a_state.kinds.size() || a_state.kinds[g_tdIndex] != VarKind::kFloat) {
+				return;
+			}
+			const float td = a_s.vars[g_tdIndex];
+			if (std::isnan(td)) {
+				return;
+			}
+			const double now = a_s.t;
+
+			auto close = [&](const char* a_how) {
+				a_state.gtActive = false;
+				const float bodyTurned = WrapPi(a_s.heading - a_state.gtHeading);
+				if (Deg(std::abs(a_state.gtPeak)) < Settings::fMinTurnDeg) {
+					return;
+				}
+				++a_state.graphTurns;
+				++g_graphTurns;
+				if (!Settings::bLogEpisodes) {
+					return;
+				}
+				a_out.push_back(std::format(
+					"[{:08X} {}] GRAPH TURN {}: asked {:+.1f}deg for {:.2f}s, body turned {:+.1f}deg | {} | fix cleared it {} frames | player {:.0f}u at {:+.0f}deg ({} the player) | events: {} | npc graph turns {}",
+					a_formID, a_state.name, a_how, Deg(a_state.gtPeak), now - a_state.gtStart, Deg(bodyTurned),
+					a_state.gtRestrained ? "RESTRAINED (can't turn)" : "standing", a_state.blocked, a_state.gtDist, Deg(a_state.gtRel),
+					(a_state.gtPeak > 0.0f) == (a_state.gtRel > 0.0f) ? "toward" : "away from",
+					EventSummary(a_state, a_state.gtStart - 0.3, now + 0.05), a_state.graphTurns));
+			};
+
+			if (!a_state.gtActive) {
+				if (std::abs(td) > 0.05f && (a_stationary || a_s.restrained)) {
+					a_state.gtActive = true;
+					a_state.gtStart = now;
+					a_state.gtQuietSince = 0.0;
+					a_state.gtPeak = td;
+					a_state.gtHeading = a_s.heading;
+					a_state.gtRel = WrapPi(a_bearing - a_s.heading);
+					a_state.gtDist = a_s.dist;
+					a_state.gtRestrained = a_s.restrained;
+					a_state.blocked = 0;
+				}
+				return;
+			}
+			if (std::abs(td) > std::abs(a_state.gtPeak)) {
+				a_state.gtPeak = td;
+			}
+			a_state.gtRestrained = a_state.gtRestrained || a_s.restrained;
+			if (std::abs(td) < 0.02f) {
+				if (a_state.gtQuietSince == 0.0) {
+					a_state.gtQuietSince = now;
+				} else if (now - a_state.gtQuietSince > 0.3) {
+					close("done");
+				}
+			} else {
+				a_state.gtQuietSince = 0.0;
+			}
+			if (a_state.gtActive && now - a_state.gtStart > 10.0) {
+				close("STILL ASKING after 10s");  // (logged every 10s while it lasts)
+			}
 		}
 
 		void Flush(std::vector<std::string>& a_lines)
@@ -428,14 +593,7 @@ namespace IdleTurn
 				s.vars[i] = i < g_varNames.size() && i < kinds.size() ? ReadVar(a_actor, g_varNames[i], kinds[i]) : std::nanf("");
 			}
 
-			// experimental fix: kill small turn requests on standing NPCs
-			if (Settings::bZeroTurnVar && g_turnVar && stationary) {
-				float v = 0.0f;
-				if (a_actor->GetGraphVariableImplFloat(*g_turnVar, v) && v != 0.0f && std::abs(v) < Settings::fZeroBelow) {
-					a_actor->SetGraphVariableFloat(*g_turnVar, 0.0f);
-					s.zeroed = true;
-				}
-			}
+			s.restrained = IsRestrained(a_actor);
 
 			// Phase 3 (locked): bookkeeping
 			std::vector<std::string> lines;
@@ -452,9 +610,6 @@ namespace IdleTurn
 						state.loggedVars = true;
 						lines.push_back(std::format("tracking [{:08X} {}] graph vars: {}", formID, state.name, VarList(state)));
 					}
-				}
-				if (s.zeroed) {
-					++g_zeroed;
 				}
 
 				const Sample* prev = state.samples.empty() ? nullptr : &state.samples.back();
@@ -499,6 +654,8 @@ namespace IdleTurn
 				} else {
 					state.samples.push_back(s);
 				}
+
+				TrackGraphTurn(formID, state, s, stationary, bearing, lines);
 
 				Trim(state, now);
 				Stats(now, lines);
@@ -571,6 +728,52 @@ namespace IdleTurn
 			logger::info("hooked Actor anim event sink (vtable #{} of Actor)", match);
 		}
 
+		// Which of Actor's vtables a sub-object of a live NPC points at (-1: none, leave it alone)
+		int ActorVtableIndex(const void* a_subobject)
+		{
+			const auto vtbl = *reinterpret_cast<const std::uintptr_t*>(a_subobject);
+			for (std::size_t i = 0; i < RE::VTABLE::Actor.size(); ++i) {
+				REL::Relocation<std::uintptr_t> candidate{ RE::VTABLE::Actor[i] };
+				if (candidate.address() == vtbl) {
+					return static_cast<int>(i);
+				}
+			}
+			return -1;
+		}
+
+		// IAnimationGraphManagerHolder::PreUpdateAnimationGraphManager: right before the NPC's graph updates, after
+		// the game has set this frame's variables. Clearing the turn request here beats the game rewriting it.
+		constexpr std::size_t kPreUpdateVfunc = 0x16;
+		using PreUpdate_t = void (*)(const RE::IAnimationGraphManagerHolder*, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>&);
+		std::atomic<PreUpdate_t> g_origPreUpdate{ nullptr };
+
+		void PreUpdateThunk(const RE::IAnimationGraphManagerHolder* a_this, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>& a_mgr)
+		{
+			g_origPreUpdate.load()(a_this, a_mgr);
+			++g_preUpdateCalls;
+			if (!a_this) {
+				return;
+			}
+			auto* actor = const_cast<RE::Actor*>(static_cast<const RE::Actor*>(static_cast<const RE::TESObjectREFR*>(a_this)));
+			if (Prevent(actor) != Blocked::kNo) {
+				++g_blockedInPreUpdate;
+			}
+		}
+
+		void HookPreUpdate(RE::Actor* a_actor)
+		{
+			auto*      holder = static_cast<RE::IAnimationGraphManagerHolder*>(a_actor);
+			const auto match = ActorVtableIndex(holder);
+			if (match < 0) {
+				logger::warn("anim graph holder vtable isn't one of Actor's; turn requests only cleared from Actor::Update");
+				return;
+			}
+			auto* const vtbl = *reinterpret_cast<std::uintptr_t**>(holder);
+			g_origPreUpdate = reinterpret_cast<PreUpdate_t>(vtbl[kPreUpdateVfunc]);
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtbl[kPreUpdateVfunc]), reinterpret_cast<std::uintptr_t>(&PreUpdateThunk));
+			logger::info("hooked Actor anim graph pre-update (vtable #{} of Actor)", match);
+		}
+
 		void LateInit(RE::Actor* a_actor)
 		{
 			for (const auto& name : Settings::sGraphVars) {
@@ -578,18 +781,29 @@ namespace IdleTurn
 					logger::warn("only the first {} sGraphVars are sampled", kMaxVars);
 					break;
 				}
+				if (std::ranges::equal(name, "TurnDelta"sv, [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); })) {
+					g_tdIndex = static_cast<int>(g_varNames.size());
+				}
 				g_varNames.emplace_back(name);
 			}
-			if (Settings::bZeroTurnVar) {
-				g_turnVar.emplace(Settings::sTurnVar);
-				logger::info("experimental fix ON: zeroing '{}' on standing NPCs when |value| < {:.3f}", Settings::sTurnVar, Settings::fZeroBelow);
+			for (const auto& name : Settings::sTurnVars) {
+				g_turnVarNames.emplace_back(name);
 			}
+			g_speedVar.emplace("Speed");
 
-			for (const auto* dll : { "HighFPSPhysicsFix.dll", "HighFPSFix.dll", "Buffout4.dll", "fo4lipsync.dll", "fo4settlementperformance.dll" }) {
+			for (const auto* dll : { "HighFPSPhysicsFix.dll", "HighFPSFix.dll", "Buffout4.dll", "fo4lipsync.dll", "fo4settlementperformance.dll", "WastelandWagers.dll" }) {
 				logger::info("module {}: {}", dll, REX::W32::GetModuleHandleA(dll) ? "loaded" : "not loaded");
 			}
 
 			HookAnimEvents(a_actor);
+			if (Settings::bPreventIdleTurns) {
+				HookPreUpdate(a_actor);
+				logger::info("fix ON: standing NPCs' turn requests cleared ({}; others below {:.0f}deg while Speed <= {:.1f}; never with a weapon out)",
+					Settings::bRestrainedNeverTurn ? "always for restrained NPCs" : "restrained NPCs like anyone else", Settings::fBlockBelowDeg,
+					Settings::fStandingSpeed);
+			} else {
+				logger::info("fix OFF: logging only");
+			}
 			g_lastStats = Now();
 			logger::info("watching NPCs within {:.0f} units of the player", Settings::fRadius);
 		}
@@ -603,7 +817,10 @@ namespace IdleTurn
 					return;
 				}
 				std::call_once(g_initOnce, LateInit, a_this);
-				OnUpdate(a_this, a_delta);
+				OnUpdate(a_this, a_delta);  // (reads what the game asked for first)
+				if (Prevent(a_this) != Blocked::kNo) {
+					NoteBlocked(a_this->GetFormID());
+				}
 			}
 
 			static inline REL::Relocation<decltype(thunk)> func;

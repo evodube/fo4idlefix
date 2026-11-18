@@ -19,10 +19,15 @@ namespace Settings
 		"bAllowRotation", "bAnimationDriven", "bHeadTrackingOn", "IsMoving"
 	};
 
-	// [Fix] (experimental, off until the log shows what drives the turn)
-	inline bool        bZeroTurnVar = false;   // zero sTurnVar on standing NPCs when it is below fZeroBelow
-	inline std::string sTurnVar = "TurnDelta";
-	inline float       fZeroBelow = 0.5f;      // in the variable's own units (TurnDelta is radians: 0.5 ~ 29 deg)
+	// [Fix]
+	// Standing NPCs get their turn request (TurnDelta) cleared before their animation updates, so the
+	// turn-in-place shuffle never starts: always for NPCs held in place (restrained: they can't turn, the
+	// feet step round and snap back), and for other standing NPCs when the turn asked for is small.
+	inline bool  bPreventIdleTurns = true;
+	inline bool  bRestrainedNeverTurn = true;  // restrained NPCs: clear every turn request, any size
+	inline float fBlockBelowDeg = 35.0f;       // other standing NPCs: clear turn requests smaller than this (0 = off)
+	inline float fStandingSpeed = 5.0f;        // graph Speed below this counts as standing
+	inline std::vector<std::string> sTurnVars{ "TurnDelta", "TurnDeltaDamped" };
 
 	void Load();
 }

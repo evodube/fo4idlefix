@@ -102,14 +102,18 @@ namespace Settings
 					if (auto list = ParseList(value); !list.empty()) {
 						sGraphVars = std::move(list);
 					}
-				} else if (key == "bzeroturnvar") {
-					bZeroTurnVar = ParseBool(value, bZeroTurnVar);
-				} else if (key == "sturnvar") {
-					if (!value.empty()) {
-						sTurnVar = value;
+				} else if (key == "bpreventidleturns") {
+					bPreventIdleTurns = ParseBool(value, bPreventIdleTurns);
+				} else if (key == "brestrainedneverturn") {
+					bRestrainedNeverTurn = ParseBool(value, bRestrainedNeverTurn);
+				} else if (key == "fblockbelowdeg") {
+					fBlockBelowDeg = std::clamp(ParseFloat(value, fBlockBelowDeg), 0.0f, 180.0f);
+				} else if (key == "fstandingspeed") {
+					fStandingSpeed = std::clamp(ParseFloat(value, fStandingSpeed), 0.0f, 100.0f);
+				} else if (key == "sturnvars") {
+					if (auto list = ParseList(value); !list.empty()) {
+						sTurnVars = std::move(list);
 					}
-				} else if (key == "fzerobelow") {
-					fZeroBelow = std::clamp(ParseFloat(value, fZeroBelow), 0.0f, 10.0f);
 				}
 			}
 		}
@@ -118,9 +122,13 @@ namespace Settings
 		for (const auto& v : sGraphVars) {
 			vars += vars.empty() ? v : "," + v;
 		}
+		std::string turnVars;
+		for (const auto& v : sTurnVars) {
+			turnVars += turnVars.empty() ? v : "," + v;
+		}
 		logger::info(
-			"settings: enabled={} episodes={} dumps={} allEvents={} radius={:.0f} minTurn={:.1f}deg stats={:.0f}s maxDumps={} vars=[{}] zeroTurnVar={} turnVar={} zeroBelow={:.3f}",
+			"settings: enabled={} episodes={} dumps={} allEvents={} radius={:.0f} minTurn={:.1f}deg stats={:.0f}s maxDumps={} vars=[{}] prevent={} restrainedNeverTurn={} blockBelow={:.0f}deg standingSpeed={:.1f} turnVars=[{}]",
 			bEnabled, bLogEpisodes, bDumpEpisodes, bLogAllEvents, fRadius, fMinTurnDeg, fStatsInterval, iMaxDumps, vars,
-			bZeroTurnVar, sTurnVar, fZeroBelow);
+			bPreventIdleTurns, bRestrainedNeverTurn, fBlockBelowDeg, fStandingSpeed, turnVars);
 	}
 }
