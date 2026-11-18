@@ -132,6 +132,7 @@ namespace IdleTurn
 		std::atomic<std::uint64_t> g_blockedRestrained{ 0 };
 		std::atomic<std::uint64_t> g_blockedSmall{ 0 };
 		std::atomic<std::uint64_t> g_preUpdateCalls{ 0 };
+		std::atomic<RE::Actor*>    g_player{ nullptr };  // set by PlayerCharacter::Update
 		constexpr std::size_t   kPollVfunc = 1;            // BSAnimationGraphChannel::PollChannelUpdateImpl
 		constexpr std::size_t   kChannelNameOffset = 0x10;
 		constexpr std::size_t   kChannelValueOffset = 0x18;
@@ -532,7 +533,9 @@ namespace IdleTurn
 			if (a_actor->IsPlayerRef()) {
 				return;
 			}
-			auto* player = RE::PlayerCharacter::GetSingleton();
+			// (the player as PlayerCharacter::Update last saw them: its singleton's address from the Address Library
+			// came out as garbage on 1.11.240, a crash reading the player's position at 0x7000000D8)
+			auto* player = g_player.load(std::memory_order_acquire);
 			if (!player) {
 				return;
 			}
@@ -580,8 +583,9 @@ namespace IdleTurn
 			// with g_lock held.
 			std::string name;
 			if (needName) {
-				const char* full = a_actor->GetDisplayFullName();
-				name = full && *full ? full : "<unnamed>";
+				// (GetDisplayFullName is an Address Library function: only trusted on 1.10.163, where it's been seen to work)
+				const char* full = REL::Module::IsNG() ? nullptr : a_actor->GetDisplayFullName();
+				name = full && *full ? full : "npc";
 			}
 			if (needProbe) {
 				kinds.assign(g_varNames.size(), VarKind::kNone);
@@ -917,7 +921,11 @@ namespace IdleTurn
 				return;
 			}
 			value = 0.0f;
-			actor->SetGraphVariableFloat(g_turnVarNames[var], 0.0f);
+			if (!REL::Module::IsNG()) {
+				// (SetGraphVariableFloat's address is an old-gen-only ID in this CommonLibF4: not called on 1.10.98x/1.11,
+				// where the channel's own value, written above, is all that's set)
+				actor->SetGraphVariableFloat(g_turnVarNames[var], 0.0f);
+			}
 			if (var == 0) {
 				++(why == Blocked::kRestrained ? g_blockedRestrained : g_blockedSmall);
 			}
@@ -1033,10 +1041,28 @@ namespace IdleTurn
 		};
 	}
 
+	namespace
+	{
+		struct PlayerUpdateHook
+		{
+			static void thunk(RE::PlayerCharacter* a_this, float a_delta)
+			{
+				func(a_this, a_delta);
+				if (a_this) {
+					g_player.store(a_this, std::memory_order_release);
+				}
+			}
+
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+	}
+
 	void Install()
 	{
 		REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE::Actor[0] };
 		UpdateHook::func = vtbl.write_vfunc(kUpdateVfunc, UpdateHook::thunk);
-		logger::info("hooked Actor::Update");
+		REL::Relocation<std::uintptr_t> pvtbl{ RE::VTABLE::PlayerCharacter[0] };
+		PlayerUpdateHook::func = pvtbl.write_vfunc(kUpdateVfunc, PlayerUpdateHook::thunk);
+		logger::info("hooked Actor::Update and PlayerCharacter::Update");
 	}
 }
