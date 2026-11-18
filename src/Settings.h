@@ -11,7 +11,7 @@ namespace Settings
 	inline bool  bLogAllEvents = false;   // every anim event of tracked NPCs, live (very spammy)
 	inline float fRadius = 1500.0f;       // only NPCs this close to the player are tracked (game units)
 	inline float fMinTurnDeg = 4.0f;      // smaller heading changes are ignored
-	inline float fStatsInterval = 60.0f;  // seconds between summary lines (0 = off)
+	inline float fStatsInterval = 30.0f;  // seconds between summary lines (0 = off)
 	inline int   iMaxDumps = 40;          // stop dumping timelines after this many (summaries continue)
 	inline std::vector<std::string> sGraphVars{
 		"Speed", "Direction", "TurnDelta", "TurnDeltaDamped", "SpeedSmoothed",
@@ -27,7 +27,7 @@ namespace Settings
 	inline bool  bRestrainedNeverTurn = true;  // restrained NPCs: clear every turn request, any size
 	inline float fBlockBelowDeg = 35.0f;       // other standing NPCs: clear turn requests smaller than this (0 = off)
 	inline float fStandingSpeed = 5.0f;        // graph Speed below this counts as standing
-	inline std::vector<std::string> sTurnVars{ "TurnDelta", "TurnDeltaDamped" };
+	inline std::vector<std::string> sTurnVars{ "TurnDelta", "TurnDeltaDamped", "TurnDeltaSmoothed" };
 
 	void Load();
 }

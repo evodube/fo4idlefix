@@ -118,6 +118,8 @@ namespace IdleTurn
 			bool   gtRestrained{ false };
 			std::uint32_t blocked{ 0 };    // frames the fix cleared this NPC's turn request (since the graph turn began)
 			std::uint32_t graphTurns{ 0 };
+			float         askedRaw{ 0.0f };   // last turn request seen on its way to the graph
+			double        askedAt{ -100.0 };
 		};
 
 		std::mutex                                   g_lock;
@@ -130,7 +132,19 @@ namespace IdleTurn
 		std::atomic<std::uint64_t> g_blockedRestrained{ 0 };
 		std::atomic<std::uint64_t> g_blockedSmall{ 0 };
 		std::atomic<std::uint64_t> g_preUpdateCalls{ 0 };
-		std::atomic<std::uint64_t> g_blockedInPreUpdate{ 0 };
+		constexpr std::size_t   kPollVfunc = 1;            // BSAnimationGraphChannel::PollChannelUpdateImpl
+		constexpr std::size_t   kChannelNameOffset = 0x10;
+		constexpr std::size_t   kChannelValueOffset = 0x18;
+		constexpr std::array<std::size_t, 4> kObjectOffsets{ 0x20, 0x28, 0x30, 0x38 };
+
+		std::atomic<std::uint64_t> g_pollCalls{ 0 };
+		std::atomic<std::uint64_t> g_pollNamed{ 0 };
+		std::atomic<std::uint64_t> g_pollWithActor{ 0 };
+		std::atomic<std::uint64_t> g_postUpdateCalls{ 0 };
+		std::array<std::atomic<std::uint32_t>, kObjectOffsets.size()> g_offsetHits{};
+		std::atomic<std::uint32_t> g_offsetMisses{ 0 };
+		std::atomic<int>           g_objectOffset{ -1 };  // index into kObjectOffsets once confirmed
+
 		std::once_flag                               g_initOnce;
 
 		// global stats (under g_lock)
@@ -347,10 +361,11 @@ namespace IdleTurn
 			if (g_dtCount > 0) {
 				const double avg = g_dtSum / static_cast<double>(g_dtCount);
 				a_out.push_back(std::format(
-					"stats: {} NPCs tracked | NPC update dt avg {:.2f}ms (~{:.0f} fps) min {:.2f}ms max {:.2f}ms | body turns {} ({} turn-and-return, {} toward player) | graph turn requests {} | fix cleared {} restrained + {} small requests ({} of them before the anim update, {} anim updates seen)",
+					"stats: {} NPCs tracked | NPC update dt avg {:.2f}ms (~{:.0f} fps) min {:.2f}ms max {:.2f}ms | body turns {} ({} turn-and-return, {} toward player) | graph turn requests {} | fix dropped {} restrained + {} small turn requests | turn channel polls {} ({} named, {} with their NPC) | graph updates {} pre / {} post | layout {}",
 					g_actors.size(), avg * 1000.0, avg > 0.0 ? 1.0 / avg : 0.0, g_dtMin * 1000.0f, g_dtMax * 1000.0f,
 					g_episodes, g_returns, g_towardPlayer, g_graphTurns, g_blockedRestrained.load(), g_blockedSmall.load(),
-					g_blockedInPreUpdate.load(), g_preUpdateCalls.load()));
+					g_pollCalls.load(), g_pollNamed.load(), g_pollWithActor.load(), g_preUpdateCalls.load(), g_postUpdateCalls.load(),
+					g_objectOffset.load() >= 0 ? "confirmed" : "NOT CONFIRMED (fix not acting yet)"));
 			}
 			g_lastStats = a_now;
 			g_dtSum = 0.0;
@@ -382,14 +397,22 @@ namespace IdleTurn
 			kSmall
 		};
 
-		// An NPC standing still (or held in place) whose animation graph asks for a turn: the request is cleared
-		// before the graph acts on it, so the turn-in-place step never starts. Held NPCs can't turn at all (their
-		// feet step round and snap back), so theirs is always cleared; anyone else only for small turns, so they
-		// still turn round to face you. Never with a weapon out (combat, aiming).
-		// Never called with g_lock held: it talks to the animation graph.
-		Blocked Prevent(RE::Actor* a_actor)
+		float Wrap180(float a_deg)
 		{
-			if (!Settings::bPreventIdleTurns || g_turnVarNames.empty() || !a_actor || a_actor->IsPlayerRef()) {
+			a_deg = std::fmod(a_deg + 180.0f, 360.0f);
+			if (a_deg < 0.0f) {
+				a_deg += 360.0f;
+			}
+			return a_deg - 180.0f;
+		}
+
+		// An NPC standing still (or held in place) whose turn request (TurnDelta, in degrees) is about to reach its
+		// animation graph: should it be dropped? Held NPCs can't turn at all (their feet step round and snap back),
+		// so theirs always is; anyone else only for small turns, so they still turn round to face you. Never with a
+		// weapon out (combat, aiming), never the player.
+		Blocked Decide(RE::Actor* a_actor, float a_turnDeg)
+		{
+			if (!Settings::bPreventIdleTurns || !a_actor || a_actor->IsPlayerRef() || a_turnDeg == 0.0f || std::isnan(a_turnDeg)) {
 				return Blocked::kNo;
 			}
 			const auto* st = StateOf(a_actor);
@@ -400,44 +423,29 @@ namespace IdleTurn
 			if (st->GetWeaponMagicDrawn()) {
 				return Blocked::kNo;
 			}
-
-			const bool held = life == RE::LIFE_STATE::kRestrained && Settings::bRestrainedNeverTurn;
-			if (!held) {
-				if (Settings::fBlockBelowDeg <= 0.0f || !g_speedVar) {
-					return Blocked::kNo;
-				}
-				float speed = 0.0f;
-				if (!a_actor->GetGraphVariableImplFloat(*g_speedVar, speed) || speed > Settings::fStandingSpeed) {
-					return Blocked::kNo;
-				}
-			}
-
-			float turn = 0.0f;
-			if (!a_actor->GetGraphVariableImplFloat(g_turnVarNames[0], turn) || turn == 0.0f || std::isnan(turn)) {
-				return Blocked::kNo;
-			}
-			if (!held && Deg(std::abs(turn)) >= Settings::fBlockBelowDeg) {
-				return Blocked::kNo;  // a real turn (to face you, say): let it happen
-			}
-			for (const auto& var : g_turnVarNames) {
-				float v = 0.0f;
-				if (a_actor->GetGraphVariableImplFloat(var, v) && v != 0.0f) {
-					a_actor->SetGraphVariableFloat(var, 0.0f);
-				}
-			}
-			if (held) {
-				++g_blockedRestrained;
+			if (life == RE::LIFE_STATE::kRestrained && Settings::bRestrainedNeverTurn) {
 				return Blocked::kRestrained;
 			}
-			++g_blockedSmall;
+			if (Settings::fBlockBelowDeg <= 0.0f || !g_speedVar || std::abs(Wrap180(a_turnDeg)) >= Settings::fBlockBelowDeg) {
+				return Blocked::kNo;  // a real turn (to face you, say): let it happen
+			}
+			float speed = 0.0f;
+			if (!a_actor->GetGraphVariableImplFloat(*g_speedVar, speed) || speed > Settings::fStandingSpeed) {
+				return Blocked::kNo;
+			}
 			return Blocked::kSmall;
 		}
 
-		void NoteBlocked(RE::TESFormID a_id)
+		// What the game asked for (the graph only ever sees 0 once the fix drops it), for the log
+		void NoteRequest(RE::TESFormID a_id, float a_raw, bool a_blocked)
 		{
 			std::scoped_lock lock(g_lock);
 			if (const auto it = g_actors.find(a_id); it != g_actors.end()) {
-				++it->second.blocked;
+				it->second.askedRaw = a_raw;
+				it->second.askedAt = Now();
+				if (a_blocked) {
+					++it->second.blocked;
+				}
 			}
 		}
 
@@ -449,16 +457,16 @@ namespace IdleTurn
 			if (g_tdIndex < 0 || static_cast<std::size_t>(g_tdIndex) >= a_state.kinds.size() || a_state.kinds[g_tdIndex] != VarKind::kFloat) {
 				return;
 			}
-			const float td = a_s.vars[g_tdIndex];
+			const double now = a_s.t;
+			const float  td = now - a_state.askedAt < 0.25 ? a_state.askedRaw : a_s.vars[g_tdIndex];
 			if (std::isnan(td)) {
 				return;
 			}
-			const double now = a_s.t;
 
 			auto close = [&](const char* a_how) {
 				a_state.gtActive = false;
 				const float bodyTurned = WrapPi(a_s.heading - a_state.gtHeading);
-				if (Deg(std::abs(a_state.gtPeak)) < Settings::fMinTurnDeg) {
+				if (std::abs(Wrap180(a_state.gtPeak)) < Settings::fMinTurnDeg) {
 					return;
 				}
 				++a_state.graphTurns;
@@ -467,15 +475,15 @@ namespace IdleTurn
 					return;
 				}
 				a_out.push_back(std::format(
-					"[{:08X} {}] GRAPH TURN {}: asked {:+.1f}deg for {:.2f}s, body turned {:+.1f}deg | {} | fix cleared it {} frames | player {:.0f}u at {:+.0f}deg ({} the player) | events: {} | npc graph turns {}",
-					a_formID, a_state.name, a_how, Deg(a_state.gtPeak), now - a_state.gtStart, Deg(bodyTurned),
+					"[{:08X} {}] GRAPH TURN {}: asked {:+.1f}deg (raw {:+.1f}) for {:.2f}s, body turned {:+.1f}deg | {} | fix cleared it {} frames | player {:.0f}u at {:+.0f}deg ({} the player) | events: {} | npc graph turns {}",
+					a_formID, a_state.name, a_how, Wrap180(a_state.gtPeak), a_state.gtPeak, now - a_state.gtStart, Deg(bodyTurned),
 					a_state.gtRestrained ? "RESTRAINED (can't turn)" : "standing", a_state.blocked, a_state.gtDist, Deg(a_state.gtRel),
-					(a_state.gtPeak > 0.0f) == (a_state.gtRel > 0.0f) ? "toward" : "away from",
+					(Wrap180(a_state.gtPeak) > 0.0f) == (a_state.gtRel > 0.0f) ? "toward" : "away from",
 					EventSummary(a_state, a_state.gtStart - 0.3, now + 0.05), a_state.graphTurns));
 			};
 
 			if (!a_state.gtActive) {
-				if (std::abs(td) > 0.05f && (a_stationary || a_s.restrained)) {
+				if (std::abs(td) > 1.0f && (a_stationary || a_s.restrained)) {
 					a_state.gtActive = true;
 					a_state.gtStart = now;
 					a_state.gtQuietSince = 0.0;
@@ -492,7 +500,7 @@ namespace IdleTurn
 				a_state.gtPeak = td;
 			}
 			a_state.gtRestrained = a_state.gtRestrained || a_s.restrained;
-			if (std::abs(td) < 0.02f) {
+			if (std::abs(td) < 0.5f) {
 				if (a_state.gtQuietSince == 0.0) {
 					a_state.gtQuietSince = now;
 				} else if (now - a_state.gtQuietSince > 0.3) {
@@ -741,37 +749,204 @@ namespace IdleTurn
 			return -1;
 		}
 
-		// IAnimationGraphManagerHolder::PreUpdateAnimationGraphManager: right before the NPC's graph updates, after
-		// the game has set this frame's variables. Clearing the turn request here beats the game rewriting it.
-		constexpr std::size_t kPreUpdateVfunc = 0x16;
-		using PreUpdate_t = void (*)(const RE::IAnimationGraphManagerHolder*, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>&);
-		std::atomic<PreUpdate_t> g_origPreUpdate{ nullptr };
+		// ------------------------------------------------------------------
+		// Where the fix acts: the turn channels
+		// ------------------------------------------------------------------
+		//
+		// TurnDelta isn't a plain graph variable the game sets once a frame: it's an animation graph channel
+		// (BSTAnimationGraphDataChannel<Actor, float, ActorTurnDeltaChannel>) polled from the actor inside the
+		// graph's own update, so clearing the variable from outside (0.2.0) was overwritten straight away. The fix
+		// now sits in the channel's poll: after the game computes the value, a dropped request is zeroed in the
+		// channel and in the graph before the graph runs on it.
+		//
+		// The channel's layout is checked live before anything is written: its name (+0x10) must be one of
+		// sTurnVars (same string-pool entry), and the actor it reads from is found by matching against the NPC whose
+		// graph update is running on this thread (pre-update to post-update).
 
-		void PreUpdateThunk(const RE::IAnimationGraphManagerHolder* a_this, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>& a_mgr)
+		thread_local RE::Actor* t_updating = nullptr;  // the NPC whose graph is updating on this thread
+
+		using Poll_t = void (*)(void*, std::uintptr_t, std::uintptr_t, std::uintptr_t);
+		std::array<std::atomic<Poll_t>, 2> g_origPoll{};
+
+		const void* PoolEntry(const RE::BSFixedString& a_str)
 		{
-			g_origPreUpdate.load()(a_this, a_mgr);
-			++g_preUpdateCalls;
-			if (!a_this) {
+			return *reinterpret_cast<const void* const*>(&a_str);
+		}
+
+		template <class T>
+		T& At(void* a_base, std::size_t a_offset)
+		{
+			return *reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(a_base) + a_offset);
+		}
+
+		bool Readable(std::uintptr_t a_addr, std::size_t a_size)
+		{
+			namespace W32 = REX::W32;
+			if (a_addr < 0x10000 || a_addr >= 0x7FFF'FFFF'FFFF || (a_addr & 0x7) != 0) {
+				return false;
+			}
+			W32::MEMORY_BASIC_INFORMATION mbi{};
+			if (W32::VirtualQuery(reinterpret_cast<const void*>(a_addr), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+				return false;
+			}
+			if (mbi.state != W32::MEM_COMMIT || (mbi.protect & 0x100u) != 0) {
+				return false;
+			}
+			const auto prot = mbi.protect & 0xFFu;
+			const bool readable = prot == W32::PAGE_READONLY || prot == W32::PAGE_READWRITE || prot == W32::PAGE_WRITECOPY ||
+			                      prot == W32::PAGE_EXECUTE_READ || prot == W32::PAGE_EXECUTE_READWRITE;
+			return readable && reinterpret_cast<std::uintptr_t>(mbi.baseAddress) + mbi.regionSize >= a_addr + a_size;
+		}
+
+		bool IsActorObject(std::uintptr_t a_ptr)
+		{
+			static const std::uintptr_t actorVtbl = REL::Relocation<std::uintptr_t>{ RE::VTABLE::Actor[0] }.address();
+			static const std::uintptr_t playerVtbl = REL::Relocation<std::uintptr_t>{ RE::VTABLE::PlayerCharacter[0] }.address();
+			if (!Readable(a_ptr, sizeof(std::uintptr_t))) {
+				return false;
+			}
+			const auto vtbl = *reinterpret_cast<const std::uintptr_t*>(a_ptr);
+			return vtbl == actorVtbl || vtbl == playerVtbl;
+		}
+
+		void OnTurnChannelPolled(void* a_channel)
+		{
+			++g_pollCalls;
+
+			// which turn variable is this channel for?
+			const void* name = At<const void*>(a_channel, kChannelNameOffset);
+			int         var = -1;
+			for (std::size_t i = 0; i < g_turnVarNames.size(); ++i) {
+				if (name && name == PoolEntry(g_turnVarNames[i])) {
+					var = static_cast<int>(i);
+					break;
+				}
+			}
+			if (var < 0) {
 				return;
 			}
-			auto* actor = const_cast<RE::Actor*>(static_cast<const RE::Actor*>(static_cast<const RE::TESObjectREFR*>(a_this)));
-			if (Prevent(actor) != Blocked::kNo) {
-				++g_blockedInPreUpdate;
+			++g_pollNamed;
+
+			// whose is it? Learnt from the NPC updating on this thread, then read from the channel itself
+			RE::Actor* actor = nullptr;
+			if (const int off = g_objectOffset.load(); off >= 0) {
+				actor = At<RE::Actor*>(a_channel, kObjectOffsets[off]);
+				if (actor != t_updating && t_updating) {
+					return;  // (an NPC's channel polled inside another's update: leave it)
+				}
+			} else {
+				// not confirmed yet: which slot holds an Actor? (its first word is Actor's or PlayerCharacter's
+				// vtable; checked as readable memory first, so a wrong guess can't crash)
+				bool hit = false;
+				for (std::size_t i = 0; i < kObjectOffsets.size(); ++i) {
+					const auto cand = At<std::uintptr_t>(a_channel, kObjectOffsets[i]);
+					const bool same = t_updating ? cand == reinterpret_cast<std::uintptr_t>(t_updating) : IsActorObject(cand);
+					if (!same) {
+						continue;
+					}
+					const auto n = ++g_offsetHits[i];
+					hit = true;
+					if (n >= 30 && n > 3 * g_offsetMisses.load()) {
+						int expected = -1;
+						if (g_objectOffset.compare_exchange_strong(expected, static_cast<int>(i))) {
+							logger::info("turn channel layout confirmed: name at +0x{:X}, value at +0x{:X}, actor at +0x{:X} ({} matches, {} misses); the fix is live",
+								kChannelNameOffset, kChannelValueOffset, kObjectOffsets[i], n, g_offsetMisses.load());
+						}
+					}
+					break;
+				}
+				if (!hit) {
+					++g_offsetMisses;
+				}
+				return;  // nothing written until the layout is confirmed
+			}
+			if (!actor) {
+				return;
+			}
+			++g_pollWithActor;
+
+			auto&       value = At<float>(a_channel, kChannelValueOffset);
+			const float raw = value;
+			if (raw != 0.0f) {
+				// (the first few: the channel's value against the graph's, to show the value offset is right)
+				static std::atomic<int> checks{ 0 };
+				if (checks.load() < 6 && checks.fetch_add(1) < 6) {
+					float graph = std::nanf("");
+					actor->GetGraphVariableImplFloat(g_turnVarNames[var], graph);
+					logger::info("turn channel check: {} {:08X} channel {:+.3f}, graph {:+.3f}{}", g_turnVarNames[var].c_str(), actor->GetFormID(), raw, graph,
+						raw == graph ? " (same)" : "");
+				}
+			}
+			const auto  why = Decide(actor, raw);
+			if (var == 0 && raw != 0.0f) {
+				NoteRequest(actor->GetFormID(), raw, why != Blocked::kNo);
+			}
+			if (why == Blocked::kNo) {
+				return;
+			}
+			value = 0.0f;
+			actor->SetGraphVariableFloat(g_turnVarNames[var], 0.0f);
+			if (var == 0) {
+				++(why == Blocked::kRestrained ? g_blockedRestrained : g_blockedSmall);
 			}
 		}
 
-		void HookPreUpdate(RE::Actor* a_actor)
+		template <std::size_t I>
+		void PollThunk(void* a_channel, std::uintptr_t a_1, std::uintptr_t a_2, std::uintptr_t a_3)
+		{
+			g_origPoll[I].load()(a_channel, a_1, a_2, a_3);
+			if (a_channel) {
+				OnTurnChannelPolled(a_channel);
+			}
+		}
+
+		template <std::size_t I>
+		void HookChannel(REL::ID a_vtable, std::string_view a_name)
+		{
+			REL::Relocation<std::uintptr_t> vtbl{ a_vtable };
+			auto* const                     slots = reinterpret_cast<std::uintptr_t*>(vtbl.address());
+			g_origPoll[I] = reinterpret_cast<Poll_t>(slots[kPollVfunc]);
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(&slots[kPollVfunc]), reinterpret_cast<std::uintptr_t>(&PollThunk<I>));
+			logger::info("hooked {} channel poll", a_name);
+		}
+
+		// IAnimationGraphManagerHolder::Pre/PostUpdateAnimationGraphManager: brackets an NPC's graph update, so the
+		// channel polls in between know whose they are
+		constexpr std::size_t kPreUpdateVfunc = 0x16;
+		constexpr std::size_t kPostUpdateVfunc = 0x17;
+		using GraphUpdate_t = void (*)(const RE::IAnimationGraphManagerHolder*, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>&);
+		std::atomic<GraphUpdate_t> g_origPreUpdate{ nullptr };
+		std::atomic<GraphUpdate_t> g_origPostUpdate{ nullptr };
+
+		void PreUpdateThunk(const RE::IAnimationGraphManagerHolder* a_this, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>& a_mgr)
+		{
+			++g_preUpdateCalls;
+			t_updating = a_this ? const_cast<RE::Actor*>(static_cast<const RE::Actor*>(static_cast<const RE::TESObjectREFR*>(a_this))) : nullptr;
+			g_origPreUpdate.load()(a_this, a_mgr);
+		}
+
+		void PostUpdateThunk(const RE::IAnimationGraphManagerHolder* a_this, const RE::BSTSmartPointer<RE::BSAnimationGraphManager>& a_mgr)
+		{
+			++g_postUpdateCalls;
+			g_origPostUpdate.load()(a_this, a_mgr);
+			t_updating = nullptr;
+		}
+
+		bool HookGraphUpdate(RE::Actor* a_actor)
 		{
 			auto*      holder = static_cast<RE::IAnimationGraphManagerHolder*>(a_actor);
 			const auto match = ActorVtableIndex(holder);
 			if (match < 0) {
-				logger::warn("anim graph holder vtable isn't one of Actor's; turn requests only cleared from Actor::Update");
-				return;
+				logger::warn("anim graph holder vtable isn't one of Actor's; the fix can't tell whose turn channel is whose, so it stays off");
+				return false;
 			}
 			auto* const vtbl = *reinterpret_cast<std::uintptr_t**>(holder);
-			g_origPreUpdate = reinterpret_cast<PreUpdate_t>(vtbl[kPreUpdateVfunc]);
+			g_origPreUpdate = reinterpret_cast<GraphUpdate_t>(vtbl[kPreUpdateVfunc]);
+			g_origPostUpdate = reinterpret_cast<GraphUpdate_t>(vtbl[kPostUpdateVfunc]);
 			REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtbl[kPreUpdateVfunc]), reinterpret_cast<std::uintptr_t>(&PreUpdateThunk));
-			logger::info("hooked Actor anim graph pre-update (vtable #{} of Actor)", match);
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtbl[kPostUpdateVfunc]), reinterpret_cast<std::uintptr_t>(&PostUpdateThunk));
+			logger::info("hooked Actor anim graph pre/post-update (vtable #{} of Actor)", match);
+			return true;
 		}
 
 		void LateInit(RE::Actor* a_actor)
@@ -796,8 +971,9 @@ namespace IdleTurn
 			}
 
 			HookAnimEvents(a_actor);
-			if (Settings::bPreventIdleTurns) {
-				HookPreUpdate(a_actor);
+			if (Settings::bPreventIdleTurns && HookGraphUpdate(a_actor)) {
+				HookChannel<0>(RE::VTABLE::BSTAnimationGraphDataChannel_Actor_float_ActorTurnDeltaChannel_[0], "TurnDelta"sv);
+				HookChannel<1>(RE::VTABLE::BSTAnimationGraphDataChannel_Actor_float_ActorTurnDeltaSmoothedChannel_[0], "TurnDeltaSmoothed"sv);
 				logger::info("fix ON: standing NPCs' turn requests cleared ({}; others below {:.0f}deg while Speed <= {:.1f}; never with a weapon out)",
 					Settings::bRestrainedNeverTurn ? "always for restrained NPCs" : "restrained NPCs like anyone else", Settings::fBlockBelowDeg,
 					Settings::fStandingSpeed);
@@ -817,10 +993,7 @@ namespace IdleTurn
 					return;
 				}
 				std::call_once(g_initOnce, LateInit, a_this);
-				OnUpdate(a_this, a_delta);  // (reads what the game asked for first)
-				if (Prevent(a_this) != Blocked::kNo) {
-					NoteBlocked(a_this->GetFormID());
-				}
+				OnUpdate(a_this, a_delta);
 			}
 
 			static inline REL::Relocation<decltype(thunk)> func;
