@@ -809,6 +809,35 @@ namespace IdleTurn
 			return vtbl == actorVtbl || vtbl == playerVtbl;
 		}
 
+		// The first few polls of each hooked channel type, raw: what's where in the channel and who's updating,
+		// so the layout can be read off the log if the live check never confirms it
+		void DumpChannel(void* a_channel, std::size_t a_type)
+		{
+			static std::array<std::atomic<int>, 2> dumped{};
+			if (dumped[a_type].load() >= 4 || dumped[a_type].fetch_add(1) >= 4) {
+				return;
+			}
+			const auto base = reinterpret_cast<std::uintptr_t>(a_channel);
+			std::string words;
+			for (std::size_t off = 0x08; off <= 0x40; off += 8) {
+				if (!Readable(base + off, 8)) {
+					words += std::format(" +{:02X}=?", off);
+					continue;
+				}
+				const auto q = *reinterpret_cast<const std::uint64_t*>(base + off);
+				float      lo = 0.0f;
+				std::memcpy(&lo, &q, sizeof(lo));
+				words += std::format(" +{:02X}={:016X}({:g}{})", off, q, lo, IsActorObject(static_cast<std::uintptr_t>(q)) ? ",ACTOR" : "");
+			}
+			std::string names;
+			for (const auto& n : g_turnVarNames) {
+				names += std::format(" {}={:X}", n.c_str(), reinterpret_cast<std::uintptr_t>(PoolEntry(n)));
+			}
+			logger::info("channel dump [{}] {:X} vtbl+{:X} updating {:X}{} | our names:{} | words:{}", a_type == 0 ? "TurnDelta" : "TurnDeltaSmoothed", base,
+				*reinterpret_cast<const std::uintptr_t*>(base) - REL::Module::get().base(), reinterpret_cast<std::uintptr_t>(t_updating),
+				t_updating ? std::format(" ({:08X})", t_updating->GetFormID()) : "", names, words);
+		}
+
 		void OnTurnChannelPolled(void* a_channel)
 		{
 			++g_pollCalls;
@@ -896,6 +925,7 @@ namespace IdleTurn
 		{
 			g_origPoll[I].load()(a_channel, a_1, a_2, a_3);
 			if (a_channel) {
+				DumpChannel(a_channel, I);
 				OnTurnChannelPolled(a_channel);
 			}
 		}
@@ -980,7 +1010,7 @@ namespace IdleTurn
 			} else {
 				logger::info("fix OFF: logging only");
 			}
-			g_lastStats = Now();
+			g_lastStats = Now() - Settings::fStatsInterval + 5.0;  // (the first one 5 s in)
 			logger::info("watching NPCs within {:.0f} units of the player", Settings::fRadius);
 		}
 

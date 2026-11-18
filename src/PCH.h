@@ -11,6 +11,7 @@
 #include <format>
 #include <optional>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <numbers>
