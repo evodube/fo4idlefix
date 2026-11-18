@@ -135,15 +135,16 @@ namespace IdleTurn
 		constexpr std::size_t   kPollVfunc = 1;            // BSAnimationGraphChannel::PollChannelUpdateImpl
 		constexpr std::size_t   kChannelNameOffset = 0x10;
 		constexpr std::size_t   kChannelValueOffset = 0x18;
-		constexpr std::array<std::size_t, 4> kObjectOffsets{ 0x20, 0x28, 0x30, 0x38 };
+		constexpr std::array<std::size_t, 5> kObjectOffsets{ 0x20, 0x28, 0x30, 0x38, 0x40 };  // (0.3.1 dump: TurnDelta +0x28, TurnDeltaSmoothed +0x40)
 
 		std::atomic<std::uint64_t> g_pollCalls{ 0 };
 		std::atomic<std::uint64_t> g_pollNamed{ 0 };
 		std::atomic<std::uint64_t> g_pollWithActor{ 0 };
 		std::atomic<std::uint64_t> g_postUpdateCalls{ 0 };
-		std::array<std::atomic<std::uint32_t>, kObjectOffsets.size()> g_offsetHits{};
-		std::atomic<std::uint32_t> g_offsetMisses{ 0 };
-		std::atomic<int>           g_objectOffset{ -1 };  // index into kObjectOffsets once confirmed
+		// per hooked channel type (their layouts differ): hits per actor slot, misses, the slot once confirmed
+		std::array<std::array<std::atomic<std::uint32_t>, kObjectOffsets.size()>, 2> g_offsetHits{};
+		std::array<std::atomic<std::uint32_t>, 2>                                     g_offsetMisses{};
+		std::array<std::atomic<int>, 2>                                               g_objectOffset{ -1, -1 };
 
 		std::once_flag                               g_initOnce;
 
@@ -358,14 +359,15 @@ namespace IdleTurn
 			if (Settings::fStatsInterval <= 0.0f || a_now - g_lastStats < Settings::fStatsInterval) {
 				return;
 			}
-			if (g_dtCount > 0) {
-				const double avg = g_dtSum / static_cast<double>(g_dtCount);
+			{
+				// (Actor::Update's delta can be 0 for NPCs: then no fps, but the line still comes)
+				const double avg = g_dtCount > 0 ? g_dtSum / static_cast<double>(g_dtCount) : 0.0;
 				a_out.push_back(std::format(
 					"stats: {} NPCs tracked | NPC update dt avg {:.2f}ms (~{:.0f} fps) min {:.2f}ms max {:.2f}ms | body turns {} ({} turn-and-return, {} toward player) | graph turn requests {} | fix dropped {} restrained + {} small turn requests | turn channel polls {} ({} named, {} with their NPC) | graph updates {} pre / {} post | layout {}",
 					g_actors.size(), avg * 1000.0, avg > 0.0 ? 1.0 / avg : 0.0, g_dtMin * 1000.0f, g_dtMax * 1000.0f,
 					g_episodes, g_returns, g_towardPlayer, g_graphTurns, g_blockedRestrained.load(), g_blockedSmall.load(),
 					g_pollCalls.load(), g_pollNamed.load(), g_pollWithActor.load(), g_preUpdateCalls.load(), g_postUpdateCalls.load(),
-					g_objectOffset.load() >= 0 ? "confirmed" : "NOT CONFIRMED (fix not acting yet)"));
+					g_objectOffset[0].load() >= 0 ? (g_objectOffset[1].load() >= 0 ? "confirmed" : "TurnDelta confirmed") : "NOT CONFIRMED (fix not acting yet)"));
 			}
 			g_lastStats = a_now;
 			g_dtSum = 0.0;
@@ -838,7 +840,7 @@ namespace IdleTurn
 				t_updating ? std::format(" ({:08X})", t_updating->GetFormID()) : "", names, words);
 		}
 
-		void OnTurnChannelPolled(void* a_channel)
+		void OnTurnChannelPolled(void* a_channel, std::size_t a_type)
 		{
 			++g_pollCalls;
 
@@ -858,7 +860,7 @@ namespace IdleTurn
 
 			// whose is it? Learnt from the NPC updating on this thread, then read from the channel itself
 			RE::Actor* actor = nullptr;
-			if (const int off = g_objectOffset.load(); off >= 0) {
+			if (const int off = g_objectOffset[a_type].load(); off >= 0) {
 				actor = At<RE::Actor*>(a_channel, kObjectOffsets[off]);
 				if (actor != t_updating && t_updating) {
 					return;  // (an NPC's channel polled inside another's update: leave it)
@@ -873,19 +875,20 @@ namespace IdleTurn
 					if (!same) {
 						continue;
 					}
-					const auto n = ++g_offsetHits[i];
+					const auto n = ++g_offsetHits[a_type][i];
 					hit = true;
-					if (n >= 30 && n > 3 * g_offsetMisses.load()) {
+					if (n >= 30 && n > 3 * g_offsetMisses[a_type].load()) {
 						int expected = -1;
-						if (g_objectOffset.compare_exchange_strong(expected, static_cast<int>(i))) {
-							logger::info("turn channel layout confirmed: name at +0x{:X}, value at +0x{:X}, actor at +0x{:X} ({} matches, {} misses); the fix is live",
-								kChannelNameOffset, kChannelValueOffset, kObjectOffsets[i], n, g_offsetMisses.load());
+						if (g_objectOffset[a_type].compare_exchange_strong(expected, static_cast<int>(i))) {
+							logger::info("{} channel layout confirmed: name at +0x{:X}, value at +0x{:X}, actor at +0x{:X} ({} matches, {} misses); the fix is live",
+								a_type == 0 ? "TurnDelta" : "TurnDeltaSmoothed", kChannelNameOffset, kChannelValueOffset, kObjectOffsets[i], n,
+								g_offsetMisses[a_type].load());
 						}
 					}
 					break;
 				}
 				if (!hit) {
-					++g_offsetMisses;
+					++g_offsetMisses[a_type];
 				}
 				return;  // nothing written until the layout is confirmed
 			}
@@ -926,7 +929,7 @@ namespace IdleTurn
 			g_origPoll[I].load()(a_channel, a_1, a_2, a_3);
 			if (a_channel) {
 				DumpChannel(a_channel, I);
-				OnTurnChannelPolled(a_channel);
+				OnTurnChannelPolled(a_channel, I);
 			}
 		}
 
